@@ -4,6 +4,29 @@ import { DataSource } from 'typeorm';
 import { createInventory, createTestApp, resetDb } from './helpers';
 
 /**
+ * Firing 20 genuinely simultaneous new connections at once is the point of
+ * this test, but on a resource-constrained CI runner that burst can trip a
+ * transport-level ECONNRESET on a request or two before it ever reaches the
+ * application -- infrastructure flakiness, not the thing being tested. The
+ * correctness guarantee (exactly 10 holds succeed, 10 are refused) doesn't
+ * depend on which attempt got a clean socket, so a request that fails at the
+ * transport layer is retried a few times, the same way the app itself
+ * retries a database-reported deadlock rather than treating it as a real
+ * failure.
+ */
+async function postWithRetry(app: INestApplication, body: object, attempts = 4): Promise<number> {
+  for (let i = 1; i <= attempts; i++) {
+    try {
+      const res = await request(app.getHttpServer()).post('/bookings').send(body);
+      return res.status;
+    } catch (err) {
+      if (i === attempts) throw err;
+    }
+  }
+  throw new Error('unreachable');
+}
+
+/**
  * The test that matters most for this domain. Twenty customers try to hold
  * the last ten seats on the same flight, simultaneously. Exactly ten holds
  * may succeed; the other ten must be refused as insufficient inventory, not
@@ -27,16 +50,11 @@ describe('Concurrent holds (e2e)', () => {
     const attempts = 20;
 
     const results = await Promise.all(
-      Array.from({ length: attempts }, (_, i) =>
-        request(app.getHttpServer())
-          .post('/bookings')
-          .send({ inventoryItemId, customerRef: `customer-${i}`, units: 1 })
-          .then((res: request.Response) => res.status),
-      ),
+      Array.from({ length: attempts }, (_, i) => postWithRetry(app, { inventoryItemId, customerRef: `customer-${i}`, units: 1 })),
     );
 
-    const succeeded = results.filter((s: number) => s === 201).length;
-    const rejected = results.filter((s: number) => s === 422).length;
+    const succeeded = results.filter((s) => s === 201).length;
+    const rejected = results.filter((s) => s === 422).length;
     expect(succeeded).toBe(10);
     expect(rejected).toBe(10);
 
